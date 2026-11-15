@@ -309,17 +309,38 @@ public class CompassOnlyPlugin extends Plugin
 		}
 
 		final int sizePercent = Math.max(MIN_SIZE_PERCENT, Math.min(MAX_SIZE_PERCENT, config.compassSize()));
-		final double diameter = Math.min(minimapBounds.width, minimapBounds.height) * sizePercent / 100.0;
+		final boolean oversized = sizePercent > 100;
+		double diameter = Math.min(minimapBounds.width, minimapBounds.height) * sizePercent / 100.0;
+		double centerX = minimapBounds.getCenterX();
+		double centerY = minimapBounds.getCenterY();
+
+		if (oversized)
+		{
+			// Grow from the minimap's centre, but slide back inwards so none of it is
+			// pushed off the edge of the game window
+			final int canvasWidth = client.getCanvasWidth();
+			final int canvasHeight = client.getCanvasHeight();
+			diameter = Math.min(diameter, Math.min(canvasWidth, canvasHeight));
+			final double radius = diameter / 2;
+			centerX = clamp(centerX, radius, canvasWidth - radius);
+			centerY = clamp(centerY, radius, canvasHeight - radius);
+		}
 
 		return new CompassGeometry(
 			minimapBounds,
 			minimap.getSpriteId(),
 			compassBounds,
 			compassMask,
-			minimapBounds.getCenterX(),
-			minimapBounds.getCenterY(),
+			centerX,
+			centerY,
 			diameter,
-			sourceDiameter);
+			sourceDiameter,
+			oversized);
+	}
+
+	private static double clamp(double value, double min, double max)
+	{
+		return max < min ? (min + max) / 2 : Math.max(min, Math.min(max, value));
 	}
 
 	/**

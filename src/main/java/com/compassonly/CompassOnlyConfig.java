@@ -11,15 +11,15 @@ public interface CompassOnlyConfig extends Config
 {
 	String GROUP = "compassonly";
 	String HIDE_FRAME = "hideFrame";
-	int MIN_SIZE = 25;
-	int MAX_SIZE = 100;
+	int MIN_SIZE = 10;
+	int MAX_SIZE = 1000;
 
 	@Range(min = MIN_SIZE, max = MAX_SIZE)
 	@Units(Units.PERCENT)
 	@ConfigItem(
 		keyName = "compassSize",
 		name = "Compass size",
-		description = "How much of the minimap's space the compass fills",
+		description = "Size of the compass. 100% fills the minimap's space. Above 100% it grows past the minimap and is drawn on top of the interface.",
 		position = 0
 	)
 	default int compassSize()

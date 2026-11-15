@@ -26,6 +26,8 @@ class CompassGeometry
 	double diameter;
 	/** Diameter of the part of the compass sprite the game normally shows. */
 	double sourceDiameter;
+	/** Bigger than the minimap's space, so it is drawn over the interface instead of in the minimap's place. */
+	boolean oversized;
 
 	boolean contains(int x, int y)
 	{

@@ -93,6 +93,13 @@ class CompassOnlyOverlay extends Overlay
 			return null;
 		}
 
+		// A compass bigger than the minimap's space would be cut off by the frame and orbs
+		// drawn after it, so leave it to the pass that draws over the finished interface
+		if (layered && geo.isOversized())
+		{
+			return null;
+		}
+
 		final BufferedImage sprite = spriteManager.getSprite(SpriteID.COMPASS, 0);
 		if (sprite == null)
 		{
@@ -169,7 +176,7 @@ class CompassOnlyOverlay extends Overlay
 			blackOut(g, compassBounds, hole(geo.getCompassMaskSprite(), compassBounds));
 		}
 
-		if (minimapHole != null)
+		if (minimapHole != null && !geo.isOversized())
 		{
 			g.translate(minimapBounds.x, minimapBounds.y);
 			g.clip(minimapHole.shape);

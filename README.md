@@ -11,7 +11,7 @@ A RuneLite plugin that removes the minimap and puts an enlarged compass in its p
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Compass size | 100% | How much of the minimap's space the compass fills (25–100%). |
+| Compass size | 100% | Size of the compass, from 10% to 1000%. 100% fills the minimap's space. Above 100% the compass grows past the minimap, is drawn on top of the interface, and is kept fully inside the game window. |
 | Smooth scaling | On | Smooths the enlarged compass. Turn off for hard pixel edges. |
 | Click to look north | On | Left-click the compass to face north. Right-click it for south, east and west. |
 | Hide minimap frame | Off | Also hides the stone frame around the minimap, leaving the orbs. Resizable layouts only. |
