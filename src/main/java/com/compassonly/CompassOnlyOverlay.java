@@ -170,8 +170,9 @@ class CompassOnlyOverlay extends Overlay
 		final Hole minimapHole = hole(geo.getMinimapMaskSprite(), minimapBounds);
 		blackOut(g, minimapBounds, minimapHole);
 
+		// When the minimap has moved into the compass's hole, that hole is in use
 		final Rectangle compassBounds = geo.getCompassBounds();
-		if (compassBounds != null)
+		if (compassBounds != null && geo.getSmallMinimapBounds() == null)
 		{
 			blackOut(g, compassBounds, hole(geo.getCompassMaskSprite(), compassBounds));
 		}

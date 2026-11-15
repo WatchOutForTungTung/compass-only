@@ -28,6 +28,9 @@ class CompassGeometry
 	double sourceDiameter;
 	/** Bigger than the minimap's space, so it is drawn over the interface instead of in the minimap's place. */
 	boolean oversized;
+	/** Where the shrunk minimap now sits, in the small compass's old spot, or null if it is hidden. */
+	@Nullable
+	Rectangle smallMinimapBounds;
 
 	boolean contains(int x, int y)
 	{

@@ -2,6 +2,8 @@ package com.compassonly;
 
 import com.google.inject.Provides;
 import java.awt.Rectangle;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import javax.inject.Inject;
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -17,6 +19,8 @@ import net.runelite.api.events.PostMenuSort;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.SpriteID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetPositionMode;
+import net.runelite.api.widgets.WidgetSizeMode;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -24,6 +28,7 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.SpriteManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.input.MouseManager;
 import net.runelite.client.ui.overlay.OverlayManager;
 
 @PluginDescriptor(
@@ -71,12 +76,26 @@ public class CompassOnlyPlugin extends Plugin
 	@Inject
 	private SpriteManager spriteManager;
 
+	@Inject
+	private MouseManager mouseManager;
+
 	private CompassOnlyOverlay layeredOverlay;
 	private CompassOnlyOverlay fallbackOverlay;
+	private InventoryScaleOverlay inventoryOverlay;
+	private InventoryMouseMapper inventoryMouseMapper;
+
+	/**
+	 * Where the real and the enlarged inventory are, or null if it is not being enlarged.
+	 * Read by the mouse mapper on the input thread, so replaced whole rather than changed.
+	 */
+	@Getter(AccessLevel.PACKAGE)
+	private volatile InventoryGeometry inventoryGeometry;
 
 	// Everything below is only touched on the client thread
 	private int partsLayout = -1;
 	private MinimapParts parts = new MinimapParts();
+	// Every minimap widget moved into a compass spot, across all layouts, with how it was before
+	private final Map<Widget, SavedLayout> movedMinimaps = new IdentityHashMap<>();
 
 	/**
 	 * Where the compass belongs on the frame being drawn, or null if it should not be drawn.
@@ -105,6 +124,11 @@ public class CompassOnlyPlugin extends Plugin
 		fallbackOverlay = new CompassOnlyOverlay(client, this, config, spriteManager, false);
 		overlayManager.add(layeredOverlay);
 		overlayManager.add(fallbackOverlay);
+
+		inventoryOverlay = new InventoryScaleOverlay(client, this, config);
+		inventoryMouseMapper = new InventoryMouseMapper(client, this);
+		overlayManager.add(inventoryOverlay);
+		mouseManager.registerMouseListener(inventoryMouseMapper);
 	}
 
 	@Override
@@ -114,15 +138,29 @@ public class CompassOnlyPlugin extends Plugin
 		overlayManager.remove(fallbackOverlay);
 		layeredOverlay = null;
 		fallbackOverlay = null;
+
+		inventoryGeometry = null;
+		mouseManager.unregisterMouseListener(inventoryMouseMapper);
+		overlayManager.remove(inventoryOverlay);
+		inventoryMouseMapper = null;
+		inventoryOverlay = null;
+
 		clientThread.invoke(this::restoreWidgets);
 	}
 
 	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
-		if (CompassOnlyConfig.GROUP.equals(event.getGroup())
-			&& CompassOnlyConfig.HIDE_FRAME.equals(event.getKey())
-			&& !config.hideFrame())
+		if (!CompassOnlyConfig.GROUP.equals(event.getGroup()))
+		{
+			return;
+		}
+
+		if (CompassOnlyConfig.MINIMAP_IN_COMPASS.equals(event.getKey()) && !config.minimapInCompass())
+		{
+			clientThread.invoke(this::restoreAllMovedMinimaps);
+		}
+		else if (CompassOnlyConfig.HIDE_FRAME.equals(event.getKey()) && !config.hideFrame())
 		{
 			clientThread.invoke(() ->
 			{
@@ -146,8 +184,11 @@ public class CompassOnlyPlugin extends Plugin
 
 		if (client.getGameState() != GameState.LOGGED_IN)
 		{
+			inventoryGeometry = null;
 			return;
 		}
+
+		inventoryGeometry = computeInventoryGeometry();
 
 		locateParts();
 		if (parts.minimap == null)
@@ -155,14 +196,128 @@ public class CompassOnlyPlugin extends Plugin
 			return;
 		}
 
-		hide(parts.minimap);
 		hide(parts.compass);
 		if (config.hideFrame())
 		{
 			hide(parts.frame);
 		}
 
-		geometry = computeGeometry();
+		final boolean swap = config.minimapInCompass() && canSwap();
+		if (swap)
+		{
+			moveMinimapIntoCompassSpot();
+			// The game's compass click area sits on top of that spot and would swallow
+			// clicks meant for the minimap. The big compass has the same options.
+			hide(parts.compassClick);
+		}
+		else
+		{
+			restoreMinimap(parts.minimap);
+			hide(parts.minimap);
+			show(parts.compassClick);
+		}
+
+		geometry = computeGeometry(swap);
+	}
+
+	/**
+	 * Grows the inventory from its bottom-right corner, which sits against the edge of the
+	 * window in every layout, then keeps it inside the window.
+	 */
+	private InventoryGeometry computeInventoryGeometry()
+	{
+		final int percent = config.inventorySize();
+		if (percent <= CompassOnlyConfig.MIN_INVENTORY_SIZE)
+		{
+			return null;
+		}
+
+		// Hidden while another side tab is open, or while the bank shows its own inventory
+		final Widget inventory = client.getWidget(InterfaceID.Inventory.ITEMS);
+		if (inventory == null || inventory.isHidden())
+		{
+			return null;
+		}
+
+		final Rectangle source = inventory.getBounds();
+		if (source == null || source.isEmpty())
+		{
+			return null;
+		}
+
+		final double scale = Math.min(percent, CompassOnlyConfig.MAX_INVENTORY_SIZE) / 100.0;
+		final int width = (int) Math.round(source.width * scale);
+		final int height = (int) Math.round(source.height * scale);
+		final int x = Math.max(0, source.x + source.width - width);
+		final int y = Math.max(0, source.y + source.height - height);
+		return new InventoryGeometry(new Rectangle(source), new Rectangle(x, y, width, height));
+	}
+
+	/**
+	 * The minimap can only take over the compass's spot if both live in the same
+	 * container, so the compass's position means the same thing for the minimap.
+	 */
+	private boolean canSwap()
+	{
+		return parts.compass != null
+			&& parts.compass.getParentId() == parts.minimap.getParentId()
+			&& parts.compass.getWidth() > 0
+			&& parts.compass.getHeight() > 0;
+	}
+
+	/**
+	 * Moves the game's own minimap into the small compass's hole and shrinks it to fit,
+	 * so it keeps everything the real minimap does: dots, click to walk, scroll to zoom.
+	 * Its shape comes from the widget's mask sprite, so it takes the compass's mask too.
+	 */
+	private void moveMinimapIntoCompassSpot()
+	{
+		final Widget minimap = parts.minimap;
+		final Widget compass = parts.compass;
+
+		if (!movedMinimaps.containsKey(minimap))
+		{
+			movedMinimaps.put(minimap, SavedLayout.of(minimap));
+		}
+
+		show(minimap);
+
+		final int x = compass.getRelativeX();
+		final int y = compass.getRelativeY();
+		final int width = compass.getWidth();
+		final int height = compass.getHeight();
+		final int mask = compass.getSpriteId();
+
+		if (minimap.getRelativeX() == x && minimap.getRelativeY() == y
+			&& minimap.getWidth() == width && minimap.getHeight() == height
+			&& minimap.getSpriteId() == mask)
+		{
+			return;
+		}
+
+		minimap.setWidthMode(WidgetSizeMode.ABSOLUTE);
+		minimap.setHeightMode(WidgetSizeMode.ABSOLUTE);
+		minimap.setOriginalWidth(width);
+		minimap.setOriginalHeight(height);
+		minimap.setSpriteId(mask);
+		// Unlike a normal position, a forced one survives the game re-laying out the interface
+		minimap.setForcedPosition(x, y);
+		minimap.revalidate();
+	}
+
+	private void restoreMinimap(Widget minimap)
+	{
+		final SavedLayout saved = movedMinimaps.remove(minimap);
+		if (saved != null)
+		{
+			saved.applyTo(minimap);
+		}
+	}
+
+	private void restoreAllMovedMinimaps()
+	{
+		movedMinimaps.forEach((widget, saved) -> saved.applyTo(widget));
+		movedMinimaps.clear();
 	}
 
 	/**
@@ -180,6 +335,13 @@ public class CompassOnlyPlugin extends Plugin
 
 		final Point mouse = client.getMouseCanvasPosition();
 		if (mouse == null || !geo.contains(mouse.getX(), mouse.getY()))
+		{
+			return;
+		}
+
+		// The small minimap overlaps the edge of the compass, and clicks there are for walking
+		final Rectangle smallMinimap = geo.getSmallMinimapBounds();
+		if (smallMinimap != null && smallMinimap.contains(mouse.getX(), mouse.getY()))
 		{
 			return;
 		}
@@ -223,6 +385,9 @@ public class CompassOnlyPlugin extends Plugin
 
 		partsLayout = layout;
 		parts = findParts(layout);
+
+		// Widgets replaced by an interface reload are gone, so there is nothing to put back
+		movedMinimaps.keySet().removeIf(widget -> !isCurrent(widget));
 	}
 
 	/**
@@ -274,10 +439,27 @@ public class CompassOnlyPlugin extends Plugin
 			found.frame = null;
 		}
 
+		found.compassClick = client.getWidget(compassClickId(layout));
+
 		return found;
 	}
 
-	private CompassGeometry computeGeometry()
+	private static int compassClickId(int layout)
+	{
+		switch (layout)
+		{
+			case InterfaceID.TOPLEVEL:
+				return InterfaceID.Toplevel.COMPASSCLICK;
+			case InterfaceID.TOPLEVEL_OSRS_STRETCH:
+				return InterfaceID.ToplevelOsrsStretch.COMPASSCLICK;
+			case InterfaceID.TOPLEVEL_PRE_EOC:
+				return InterfaceID.ToplevelPreEoc.COMPASSCLICK;
+			default:
+				return -1;
+		}
+	}
+
+	private CompassGeometry computeGeometry(boolean swapped)
 	{
 		final Widget minimap = parts.minimap;
 
@@ -289,7 +471,10 @@ public class CompassOnlyPlugin extends Plugin
 			return null;
 		}
 
-		final Rectangle minimapBounds = canvasBounds(minimap);
+		// The big compass goes where the minimap normally is, not where it has been moved to
+		final SavedLayout saved = movedMinimaps.get(minimap);
+		final Rectangle minimapBounds = saved != null ? saved.homeBounds(minimap) : canvasBounds(minimap);
+		final int minimapMask = saved != null ? saved.spriteId : minimap.getSpriteId();
 		if (minimapBounds.isEmpty())
 		{
 			return null;
@@ -328,14 +513,15 @@ public class CompassOnlyPlugin extends Plugin
 
 		return new CompassGeometry(
 			minimapBounds,
-			minimap.getSpriteId(),
+			minimapMask,
 			compassBounds,
 			compassMask,
 			centerX,
 			centerY,
 			diameter,
 			sourceDiameter,
-			oversized);
+			oversized,
+			swapped ? canvasBounds(minimap) : null);
 	}
 
 	private static double clamp(double value, double min, double max)
@@ -370,6 +556,7 @@ public class CompassOnlyPlugin extends Plugin
 			restore(findParts(layout));
 		}
 		restore(parts);
+		restoreAllMovedMinimaps();
 
 		parts = new MinimapParts();
 		partsLayout = -1;
@@ -382,6 +569,7 @@ public class CompassOnlyPlugin extends Plugin
 		show(target.minimap);
 		show(target.compass);
 		show(target.frame);
+		show(target.compassClick);
 	}
 
 	private static void hide(Widget widget)
@@ -405,5 +593,86 @@ public class CompassOnlyPlugin extends Plugin
 		private Widget minimap;
 		private Widget compass;
 		private Widget frame;
+		private Widget compassClick;
+	}
+
+	/**
+	 * How a minimap widget was laid out before it was moved, so it can be put back.
+	 */
+	private static final class SavedLayout
+	{
+		private final int originalX;
+		private final int originalY;
+		private final int originalWidth;
+		private final int originalHeight;
+		private final int xMode;
+		private final int yMode;
+		private final int widthMode;
+		private final int heightMode;
+		private final int spriteId;
+
+		private SavedLayout(Widget widget)
+		{
+			originalX = widget.getOriginalX();
+			originalY = widget.getOriginalY();
+			originalWidth = widget.getOriginalWidth();
+			originalHeight = widget.getOriginalHeight();
+			xMode = widget.getXPositionMode();
+			yMode = widget.getYPositionMode();
+			widthMode = widget.getWidthMode();
+			heightMode = widget.getHeightMode();
+			spriteId = widget.getSpriteId();
+		}
+
+		static SavedLayout of(Widget widget)
+		{
+			return new SavedLayout(widget);
+		}
+
+		void applyTo(Widget widget)
+		{
+			widget.setForcedPosition(-1, -1);
+			widget.setWidthMode(widthMode);
+			widget.setHeightMode(heightMode);
+			widget.setOriginalWidth(originalWidth);
+			widget.setOriginalHeight(originalHeight);
+			widget.setXPositionMode(xMode);
+			widget.setYPositionMode(yMode);
+			widget.setOriginalX(originalX);
+			widget.setOriginalY(originalY);
+			widget.setSpriteId(spriteId);
+			widget.revalidate();
+		}
+
+		/**
+		 * Where the widget would be on the canvas if it had not been moved, worked out from
+		 * its original layout and its container's current size.
+		 */
+		Rectangle homeBounds(Widget widget)
+		{
+			final Widget parent = widget.getParent();
+			if (parent == null || widthMode != WidgetSizeMode.ABSOLUTE || heightMode != WidgetSizeMode.ABSOLUTE)
+			{
+				return new Rectangle();
+			}
+
+			final Rectangle parentBounds = canvasBounds(parent);
+			final int x = position(xMode, originalX, parentBounds.width, originalWidth);
+			final int y = position(yMode, originalY, parentBounds.height, originalHeight);
+			return new Rectangle(parentBounds.x + x, parentBounds.y + y, originalWidth, originalHeight);
+		}
+
+		private static int position(int mode, int offset, int parentSize, int size)
+		{
+			switch (mode)
+			{
+				case WidgetPositionMode.ABSOLUTE_CENTER:
+					return (parentSize - size) / 2 + offset;
+				case WidgetPositionMode.ABSOLUTE_RIGHT:
+					return parentSize - size - offset;
+				default:
+					return offset;
+			}
+		}
 	}
 }
