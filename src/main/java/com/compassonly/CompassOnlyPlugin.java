@@ -15,6 +15,7 @@ import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.Point;
 import net.runelite.api.events.BeforeRender;
+import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.PostMenuSort;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.SpriteID;
@@ -23,18 +24,21 @@ import net.runelite.api.widgets.WidgetPositionMode;
 import net.runelite.api.widgets.WidgetSizeMode;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.SpriteManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.config.RuneLiteConfig;
 import net.runelite.client.input.MouseManager;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
 import net.runelite.client.ui.overlay.OverlayManager;
 
 @PluginDescriptor(
 	name = "Compass Only",
-	description = "Hides the minimap and shows an enlarged compass in its place",
-	tags = {"minimap", "compass", "hide", "hud", "immersion"}
+	description = "Big compass in place of the minimap, plus bigger side panels and a bigger, wider bank",
+	tags = {"minimap", "compass", "hide", "hud", "immersion", "inventory", "prayer", "spellbook", "equipment", "bank", "scale", "resize", "zoom", "ui"}
 )
 public class CompassOnlyPlugin extends Plugin
 {
@@ -79,10 +83,23 @@ public class CompassOnlyPlugin extends Plugin
 	@Inject
 	private MouseManager mouseManager;
 
+	@Inject
+	private EventBus eventBus;
+
+	@Inject
+	private TooltipManager tooltipManager;
+
+	@Inject
+	private RuneLiteConfig runeLiteConfig;
+
+	// Whether the minimap and compass have been changed and need putting back
+	private boolean compassActive;
+
 	private CompassOnlyOverlay layeredOverlay;
 	private CompassOnlyOverlay fallbackOverlay;
 	private InventoryScaleOverlay inventoryOverlay;
 	private InventoryMouseMapper inventoryMouseMapper;
+	private BankWidener bankWidener;
 
 	/**
 	 * Where the real and the enlarged inventory are, or null if it is not being enlarged.
@@ -90,6 +107,9 @@ public class CompassOnlyPlugin extends Plugin
 	 */
 	@Getter(AccessLevel.PACKAGE)
 	private volatile InventoryGeometry inventoryGeometry;
+
+	// The menu the game built for the real panel last frame, while the mouse was over its copy
+	private SavedMenuEntry[] copyMenu;
 
 	// Everything below is only touched on the client thread
 	private int partsLayout = -1;
@@ -125,10 +145,13 @@ public class CompassOnlyPlugin extends Plugin
 		overlayManager.add(layeredOverlay);
 		overlayManager.add(fallbackOverlay);
 
-		inventoryOverlay = new InventoryScaleOverlay(client, this, config);
+		bankWidener = new BankWidener(client);
 		inventoryMouseMapper = new InventoryMouseMapper(client, this);
+		inventoryOverlay = new InventoryScaleOverlay(client, this, inventoryMouseMapper, tooltipManager, runeLiteConfig);
 		overlayManager.add(inventoryOverlay);
 		mouseManager.registerMouseListener(inventoryMouseMapper);
+		eventBus.register(copyMenuRecorder);
+		mouseManager.registerMouseWheelListener(inventoryMouseMapper);
 	}
 
 	@Override
@@ -140,11 +163,17 @@ public class CompassOnlyPlugin extends Plugin
 		fallbackOverlay = null;
 
 		inventoryGeometry = null;
+		eventBus.unregister(copyMenuRecorder);
+		copyMenu = null;
 		mouseManager.unregisterMouseListener(inventoryMouseMapper);
+		mouseManager.unregisterMouseWheelListener(inventoryMouseMapper);
 		overlayManager.remove(inventoryOverlay);
 		inventoryMouseMapper = null;
 		inventoryOverlay = null;
 
+		final BankWidener widener = bankWidener;
+		bankWidener = null;
+		clientThread.invoke(widener::restore);
 		clientThread.invoke(this::restoreWidgets);
 	}
 
@@ -188,7 +217,23 @@ public class CompassOnlyPlugin extends Plugin
 			return;
 		}
 
-		inventoryGeometry = computeInventoryGeometry();
+		// Widen the bank first, so its enlarged copy is sized from the widened window
+		bankWidener.update(config.bankColumns());
+
+		// The bank hides the normal inventory while it is open, so only one is ever enlarged
+		final InventoryGeometry bank = computeBankGeometry();
+		inventoryGeometry = bank != null ? bank : computeSidePanelGeometry();
+
+		if (!config.showCompass())
+		{
+			if (compassActive)
+			{
+				restoreWidgets();
+				compassActive = false;
+			}
+			return;
+		}
+		compassActive = true;
 
 		locateParts();
 		if (parts.minimap == null)
@@ -221,25 +266,19 @@ public class CompassOnlyPlugin extends Plugin
 	}
 
 	/**
-	 * Grows the inventory from its bottom-right corner, which sits against the edge of the
-	 * window in every layout, then keeps it inside the window.
+	 * Enlarges the whole side panel, frame and all, while a tab with a size setting is
+	 * open. It grows from the panel's bottom-right corner, which sits against the edge of
+	 * the window in every layout, and is kept inside the window.
 	 */
-	private InventoryGeometry computeInventoryGeometry()
+	private InventoryGeometry computeSidePanelGeometry()
 	{
-		final int percent = config.inventorySize();
+		final int percent = openTabSize();
 		if (percent <= CompassOnlyConfig.MIN_INVENTORY_SIZE)
 		{
 			return null;
 		}
 
-		// Hidden while another side tab is open, or while the bank shows its own inventory
-		final Widget inventory = client.getWidget(InterfaceID.Inventory.ITEMS);
-		if (inventory == null || inventory.isHidden())
-		{
-			return null;
-		}
-
-		final Rectangle source = inventory.getBounds();
+		final Rectangle source = sidePanelBounds();
 		if (source == null || source.isEmpty())
 		{
 			return null;
@@ -250,6 +289,120 @@ public class CompassOnlyPlugin extends Plugin
 		final int height = (int) Math.round(source.height * scale);
 		final int x = Math.max(0, source.x + source.width - width);
 		final int y = Math.max(0, source.y + source.height - height);
+		return new InventoryGeometry(source, new Rectangle(x, y, width, height));
+	}
+
+	/**
+	 * The size setting for the side tab that is open, or 100 if it has none. Each tab is
+	 * its own interface, hidden while another tab is open. The bank shows its own copy
+	 * of the inventory, so the inventory tab counts as closed while the bank is open.
+	 */
+	private int openTabSize()
+	{
+		if (isOpen(InterfaceID.Inventory.ITEMS))
+		{
+			return config.inventorySize();
+		}
+		if (isOpen(InterfaceID.PRAYERBOOK << 16))
+		{
+			return config.prayerSize();
+		}
+		if (isOpen(InterfaceID.COMBAT_INTERFACE << 16))
+		{
+			return config.combatSize();
+		}
+		if (isOpen(InterfaceID.WORNITEMS << 16))
+		{
+			return config.equipmentSize();
+		}
+		if (isOpen(InterfaceID.MAGIC_SPELLBOOK << 16))
+		{
+			return config.spellbookSize();
+		}
+		return CompassOnlyConfig.MIN_INVENTORY_SIZE;
+	}
+
+	private boolean isOpen(int componentId)
+	{
+		final Widget widget = client.getWidget(componentId);
+		return widget != null && !widget.isHidden();
+	}
+
+	/**
+	 * The side panel with its stone frame, in canvas pixels. In the classic layouts that
+	 * includes the rows of tab buttons, so those are enlarged and clickable too.
+	 */
+	private Rectangle sidePanelBounds()
+	{
+		switch (client.getTopLevelInterfaceId())
+		{
+			case InterfaceID.TOPLEVEL_OSRS_STRETCH:
+				return visibleBounds(InterfaceID.ToplevelOsrsStretch.SIDE_MENU);
+			case InterfaceID.TOPLEVEL_PRE_EOC:
+				return visibleBounds(InterfaceID.ToplevelPreEoc.SIDE_CONTAINER);
+			case InterfaceID.TOPLEVEL:
+			{
+				final Rectangle panel = visibleBounds(InterfaceID.Toplevel.SIDE);
+				final Rectangle top = visibleBounds(InterfaceID.Toplevel.SIDE_TOP_CONTAINER);
+				final Rectangle bottom = visibleBounds(InterfaceID.Toplevel.SIDE_BOTTOM_CONTAINER);
+				if (panel == null || top == null || bottom == null)
+				{
+					return null;
+				}
+				return panel.union(top).union(bottom);
+			}
+			default:
+				return null;
+		}
+	}
+
+	private Rectangle visibleBounds(int componentId)
+	{
+		final Widget widget = client.getWidget(componentId);
+		if (widget == null || widget.isHidden())
+		{
+			return null;
+		}
+		final Rectangle bounds = widget.getBounds();
+		return bounds == null || bounds.isEmpty() ? null : new Rectangle(bounds);
+	}
+
+	/**
+	 * Grows the bank window outwards from its centre, by as much as fits in the game window.
+	 */
+	private InventoryGeometry computeBankGeometry()
+	{
+		final int percent = config.bankSize();
+		if (percent <= CompassOnlyConfig.MIN_BANK_SIZE)
+		{
+			return null;
+		}
+
+		final Widget bank = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
+		if (bank == null || bank.isHidden())
+		{
+			return null;
+		}
+
+		final Rectangle source = bank.getBounds();
+		if (source == null || source.isEmpty())
+		{
+			return null;
+		}
+
+		final int canvasWidth = client.getCanvasWidth();
+		final int canvasHeight = client.getCanvasHeight();
+		double scale = Math.min(percent, CompassOnlyConfig.MAX_BANK_SIZE) / 100.0;
+		scale = Math.min(scale, Math.min((double) canvasWidth / source.width, (double) canvasHeight / source.height));
+		if (scale <= 1)
+		{
+			return null;
+		}
+
+		final int width = (int) Math.round(source.width * scale);
+		final int height = (int) Math.round(source.height * scale);
+		final int x = (int) clamp(source.getCenterX() - width / 2.0, 0, canvasWidth - width);
+		final int y = (int) clamp(source.getCenterY() - height / 2.0, 0, canvasHeight - height);
 		return new InventoryGeometry(new Rectangle(source), new Rectangle(x, y, width, height));
 	}
 
@@ -323,6 +476,49 @@ public class CompassOnlyPlugin extends Plugin
 	/**
 	 * Gives the enlarged compass the same click options as the game's own compass.
 	 */
+	/**
+	 * While the mouse is over an enlarged panel, the game is told it is over the real one,
+	 * so the menu it builds each frame has the options for what is under the mouse there:
+	 * Use, Drop, Eat and so on. Keep a copy, made after other plugins have changed the menu.
+	 */
+	private final Object copyMenuRecorder = new Object()
+	{
+		// RuneLite allows one handler per event per object, named after the event, so
+		// this runs on its own to get its own, late, place in the order
+		@Subscribe(priority = -100)
+		public void onPostMenuSort(PostMenuSort event)
+		{
+			final InventoryMouseMapper mapper = inventoryMouseMapper;
+			// After a right-click on the copy the game rebuilds the menu for whatever is
+			// behind it, so keep the copy made before the click
+			if (mapper == null || client.isMenuOpen() || mapper.isRightClickPending())
+			{
+				return;
+			}
+			copyMenu = mapper.getMappedFrom() != null ? SavedMenuEntry.copyOf(client.getMenu().getMenuEntries()) : null;
+		}
+	};
+
+	/**
+	 * A right-click on an enlarged panel is passed to the game where it really happened, so
+	 * the menu opens at the cursor. The game fills that menu for whatever is behind the
+	 * enlarged panel, so put back the options for what was under the mouse on the real one.
+	 */
+	@Subscribe(priority = 100)
+	public void onMenuOpened(MenuOpened event)
+	{
+		final InventoryMouseMapper mapper = inventoryMouseMapper;
+		final SavedMenuEntry[] saved = copyMenu;
+		if (mapper == null || !mapper.takeRightClickOnCopy() || saved == null || saved.length == 0)
+		{
+			return;
+		}
+
+		final Menu menu = client.getMenu();
+		SavedMenuEntry.restoreInto(menu, saved);
+		event.setMenuEntries(menu.getMenuEntries());
+	}
+
 	@Subscribe
 	public void onPostMenuSort(PostMenuSort event)
 	{

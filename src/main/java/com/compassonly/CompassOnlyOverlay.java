@@ -123,9 +123,7 @@ class CompassOnlyOverlay extends Overlay
 	private void draw(Graphics2D g, CompassGeometry geo, BufferedImage sprite)
 	{
 		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-		g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, config.smoothScaling()
-			? RenderingHints.VALUE_INTERPOLATION_BILINEAR
-			: RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+		g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
 		if (!client.isResized())
 		{
